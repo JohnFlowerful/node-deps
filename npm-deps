@@ -32,43 +32,6 @@ use Pod::Usage qw(pod2usage);
 
 our $VERSION = 1.20;
 
-=head1 SYNOPSIS
-
-npm-deps [action] [options]
-
-  Actions:
-    fixup-lockfile  Fix potential issues in package-lock.json
-    download        Download and verify all dependency archives
-        --pack          Tarball dependencies into a single archive once download
-                        is complete
-        --update        Only download the required dependencies and verify existing
-                        dependency integrities.
-                        Also asks to delete any files not found in the updated
-                        lockfile
-        --no-verify     Disable dependency integrity checks
-        --no-cleanup    Don't delete tmpdirs created for git based dependencies
-
-    uris            Processes package-lock.json as would the download action, but
-                    only print the URLs in a format compatible with Portage's
-                    SRC_URI variable
-    cacache         Generate an npm compatible cacache structure
-    verify-files    Verify downloaded archives against package-lock.json's 
-                    integrity string
-
-  General options:
-    --lockfile      Set the location of package-lock.json file
-    --find          Descend into the current working directory and find all files
-                    titled package-lock.json, then run the action and combine the
-                    output
-    --exclude       Used in conjunction with --find. Exclude a package-lock.json
-                    file or directory tree. Can be used multiple times
-    --verbose       Show what's happening
-    --delete        Delete mismatched/extraneous dependencies and don't ask to do it
-    --no-delete     Don't delete mismatched/extraneous dependencies
-    -h, --help      Show this help message
-    -V, --version   Show script version
-=cut
-
 # cleanup on signal
 for my $signal (qw/HUP INT QUIT TERM/) {
 	$SIG{$signal} = \&trap_cleanup;
@@ -1030,3 +993,40 @@ sub option_consistency_checks {
 }
 
 main()
+
+=head1 SYNOPSIS
+
+npm-deps [action] [options]
+
+  Actions:
+    fixup-lockfile  Fix potential issues in package-lock.json
+    download        Download and verify all dependency archives
+        --pack          Tarball dependencies into a single archive once download
+                        is complete
+        --update        Only download the required dependencies and verify existing
+                        dependency integrities.
+                        Also asks to delete any files not found in the updated
+                        lockfile
+        --no-verify     Disable dependency integrity checks
+        --no-cleanup    Don't delete tmpdirs created for git based dependencies
+
+    uris            Processes package-lock.json as would the download action, but
+                    only print the URLs in a format compatible with Portage's
+                    SRC_URI variable
+    cacache         Generate an npm compatible cacache structure
+    verify-files    Verify downloaded archives against package-lock.json's 
+                    integrity string
+
+  General options:
+    --lockfile      Set the location of package-lock.json file
+    --find          Descend into the current working directory and find all files
+                    titled package-lock.json, then run the action and combine the
+                    output
+    --exclude       Used in conjunction with --find. Exclude a package-lock.json
+                    file or directory tree. Can be used multiple times
+    --verbose       Show what's happening
+    --delete        Delete mismatched/extraneous dependencies and don't ask to do it
+    --no-delete     Don't delete mismatched/extraneous dependencies
+    -h, --help      Show this help message
+    -V, --version   Show script version
+=cut
