@@ -1,10 +1,19 @@
 #!/usr/bin/env perl
 # PODNAME: npm-deps
-# ABSTRACT: A helper script for npm based Gentoo ebuilds
+# ABSTRACT: A helper script to ease maintaining of nodejs based Gentoo ebuilds
 
 # relevant links:
 # https://github.com/npm/pacote/tree/main
 # https://github.com/NixOS/nixpkgs/tree/master/pkgs/build-support/node/fetch-npm-deps
+
+# cacache generating doesn't work correctly with the npm version shipped with
+# net-libs/nodejs-24.11.1-r1 (11.6.2). it appears to be a dependency resolution
+# problem which causes `npm ci --ignore-scripts --legacy-peer-deps` to attempt
+# to download the manifest for packages that are set to a version that doesn't
+# have an entry in package-lock.json
+# maybe https://github.com/npm/cli/pull/8981 will fix this
+# yes it does fix the issue. now waiting for npm v11.10.1 to be released with
+# stable net-libs/nodejs
 
 use strict;
 use warnings;
@@ -13,6 +22,7 @@ use Cwd qw(abs_path);
 use Term::ANSIColor;
 use File::Find;
 use JSON::PP qw(encode_json decode_json);
+use YAML::PP;
 use URI ();
 
 use File::Path qw(make_path rmtree);
@@ -22,15 +32,16 @@ use IPC::Run3 qw(run3);
 use Digest::SHA qw(sha1 sha512 sha256);
 use LWP::UserAgent ();
 use MIME::Base64 qw(decode_base64 encode_base64);
-use File::Basename qw(dirname);
+use File::Basename qw(basename dirname);
+use Scalar::Util qw(reftype);
 
 use Getopt::Long qw(GetOptions);
 Getopt::Long::Configure ('bundling', 'no_ignore_case', 'no_getopt_compat', 'no_auto_abbrev');
 use Pod::Usage qw(pod2usage);
 
-#use Data::Dumper;
+use Data::Dumper;
 
-our $VERSION = 1.20;
+our $VERSION = 2.0;
 
 # cleanup on signal
 for my $signal (qw/HUP INT QUIT TERM/) {
@@ -40,10 +51,25 @@ for my $signal (qw/HUP INT QUIT TERM/) {
 # hashes used for options and actions
 my (%opt, %act);
 
-# variables set by env eventually
 my $cwd = Cwd::abs_path();
-my $deps_dir = $ENV{'NPM_DEPS_DIR'} || "$cwd/npm-deps";
-my $cache_dir = $ENV{'NPM_CACHE_DIR'} || "$cwd/npm-cache";
+
+# variables set by command options. can be overridden by env variables
+my $project_dir; # PROJECT_DIR
+my $deps_dir; # DEPS_DIR
+my $cache_dir; # CACHE_DIR
+
+# package manager things
+my $npm_lock = 'package-lock.json';
+my $pnpm_lock = 'pnpm-lock.yaml';
+my $yarn_lock = 'yarn.lock';
+my %friendly_lock = (
+	$npm_lock => 'npm',
+	$pnpm_lock => 'pnpm',
+	$yarn_lock => 'yarn'
+);
+
+my $lock; # main project lockfile found in $project_dir
+my $pm_lock; # lockfile the package manager expects
 
 # output things
 my $prefix_str=' *';
@@ -58,26 +84,21 @@ sub main {
 
 	my @lockfiles;
 	if ($opt{'find'}) {
-		find(sub {
-			if (-f && ($_ eq 'package-lock.json')) {
-				if (scalar(grep {($File::Find::dir =~ /^$cwd\/$_/ || $File::Find::name =~ /^$cwd\/$_$/)} @{$opt{'exclude'}}) == 0) {
-					logger("Found lockfile \"$File::Find::name\"");
-					push(@lockfiles, $File::Find::name);
-				}
-				else {
-					logger("Excluding lockfile \"$File::Find::name\"");
-				}
-			}
-		}, $cwd);
+		my @found = Util::find_file($pm_lock, $project_dir, $opt{'depth'}, @{$opt{'exclude'}});
+		@lockfiles = (@lockfiles, @found);
 	}
 	else {
-		push(@lockfiles, $opt{'lockfile'} || 'package-lock.json');
+		push(@lockfiles, $lock);
 	}
 
 	# do this before loading up @packages
 	if ($act{'fixup-lockfile'}) {
+		# only npm is supported for now. no error or warning
+		if ($pm_lock ne $npm_lock) {
+			return show("Action unsupported for $friendly_lock{$pm_lock}. Skipping");
+		}
 		for my $lock (@lockfiles) {
-			my $data = fixup_lockfile(Util::read_file_as($lock, 'encoding(UTF-8)'));
+			my $data = fixup_lockfile(Util::read_file($lock));
 			# it wont be pretty~
 			Util::write_file($lock, JSON::PP::encode_json($$data)) if $data;
 		}
@@ -87,11 +108,11 @@ sub main {
 
 		if ($act{'download'}) {
 			mkdir $deps_dir;
-			if (!Util::is_empty_dir($deps_dir)) {
+			unless (Util::is_empty_dir($deps_dir)) {
 				warning("Warning: $deps_dir directory exists");
-				$opt{'update'} = 1 if Util::prompt_yn("Do you want to update it");
-
-				error_handler('dir-not-empty', $deps_dir) if !$opt{'update'};
+				unless (defined $opt{'update'} || Util::prompt_yn('Do you want to update it')) {
+					error_handler('dir-not-empty', $deps_dir);
+				}
 
 				my ($found, $not_found) = compare_dir_to_lockfile($deps_dir, @$packages);
 
@@ -99,9 +120,8 @@ sub main {
 
 				if ($opt{'verify'}) {
 					for my $pkg (values @$found) {
-						my $data = Util::fetch($pkg->{'filename'});
-						if (!$pkg->verify($data)) {
-							if (!$opt{'no-delete'} && ($opt{'delete'} || Util::prompt_yn("Do you want to re-download this package"))) {
+						if (!$pkg->verify()) {
+							if (!$opt{'no-delete'} && ($opt{'delete'} || Util::prompt_yn('Do you want to re-download this package'))) {
 								push(@$packages, $pkg);
 								my $file = "$deps_dir/$pkg->{'filename'}";
 								logger("Deleting file $file");
@@ -113,7 +133,7 @@ sub main {
 			}
 
 			for my $pkg (values @$packages) {
-				my $data = Util::fetch($pkg->{'filename'}, $pkg->{'url'});
+				my $data = $pkg->get();
 
 				$pkg->verify($data) if $opt{'verify'};
 
@@ -127,8 +147,8 @@ sub main {
 			}
 
 			if ($opt{'pack'}) {
-				my $filename = "npm-deps.tar.gz";
-				$deps_dir =~ s/$cwd\///;
+				my $filename = "$friendly_lock{$pm_lock}-deps.tar.gz";
+				$deps_dir =~ s/^$cwd\///;
 				my @cmd = (
 					'tar',
 					'--auto-compress',
@@ -152,26 +172,29 @@ sub main {
 			for my $pkg (values @$packages) {
 				my @segments = $pkg->{'uri'}->path_segments();
 				if ($segments[-1] ne $pkg->{'filename'}) {
-					push(@urls, "$pkg->{'url'} -> $pkg->{'filename'}");
+					push(@urls, "$pkg->{'uri'} -> $pkg->{'filename'}");
 					next;
 				}
-				push(@urls, "$pkg->{'url'}");
+				push(@urls, "$pkg->{'uri'}");
 			}
 			print join("\n", sort @urls) . "\n";
 		}
 
-		elsif ($act{'cacache'}) {
+		elsif ($act{'cache'}) {
+			if ($pm_lock ne $npm_lock) {
+				return show("Action unsupported for $friendly_lock{$pm_lock}. Skipping");
+			}
 			my ($found, $not_found) = compare_dir_to_lockfile($deps_dir, @$packages);
 
 			my $dir = Path->new("$cache_dir/_cacache");
 			Path::make_path($dir);
 			error_handler('dir-not-empty', $$dir) if !Util::is_empty_dir($$dir);
 
-			my $cacache = Cacache->new($dir);
-			$cacache->init();
+			my $cache = Cacache->new($dir);
+			$cache->init();
 
 			for my $pkg (values @$packages) {
-				$cacache->put("make-fetch-happen:request-cache:$pkg->{'url'}", $pkg->{'url'}, "$deps_dir/$pkg->{'filename'}", $pkg->integrity());
+				$cache->put("make-fetch-happen:request-cache:$pkg->{'uri'}", $pkg->{'uri'}, "$deps_dir/$pkg->{'filename'}", $pkg->integrity());
 			}
 		}
 
@@ -180,13 +203,12 @@ sub main {
 
 			my $bad = 0;
 			for my $pkg (values @$found) {
-				my $data = Util::fetch($pkg->{'filename'});
-				$pkg->verify($data) ? next : ($bad = 1);
+				$pkg->verify() ? next : ($bad = 1);
 			}
 
 			$bad = 1 if scalar @$not_found;
 			for my $pkg (values @$not_found) {
-				error("File not found for $pkg->{'name'}");
+				error("File not found for package $pkg->{'name'}");
 			}
 
 			logger('Successfully verified all files') if !$bad;
@@ -204,10 +226,10 @@ sub fixup_lockfile {
 	if ($lock_ver =~ m/2|3/) {
 		for my $pkg (values %{$decoded_lock->{'packages'}}) {
 			# https://docs.npmjs.com/cli/configuring-npm/package-lock-json#packages
-			my $uri = \URI->new($pkg->{'resolved'});
-			if (defined $$uri->scheme) {
+			my $uri = URI->new($pkg->{'resolved'});
+			if (defined $uri->scheme) {
 				if ($pkg->{'integrity'}) {
-					if ($$uri->scheme =~ m/^(git|git\+ssh|git\+https|ssh)$/) {
+					if ($uri->scheme =~ m/^(git|git\+ssh|git\+https|ssh)$/) {
 						$fixed = 1;
 						delete $pkg->{'integrity'};
 					}
@@ -229,7 +251,7 @@ sub compare_dir_to_lockfile {
 	my ($dir, @packages) = @_;
 
 	my (%pkg_files, %dir_files);
-	%pkg_files = map {$_->{'filename'} => $_} @packages;
+	%pkg_files = map { $_->{'filename'} => $_ } @packages;
 	find(sub {-f && ($dir_files{$_} = 1)}, $dir);
 
 	# compare
@@ -249,10 +271,10 @@ sub compare_dir_to_lockfile {
 	# %dir_files now contains files not listed in the lockfile
 	# ask to delete them
 	if (keys %dir_files && !$opt{'no-delete'}) {
-		warning("Warning: files not referenced in package-lock.json found!");
+		warning('Warning: files not referenced in package-lock.json found!');
 		
 		if (!$opt{'delete'}) {
-			Util::prompt_yn("Do you want to continue") || error_handler('dont-continue');
+			Util::prompt_yn('Do you want to continue') || error_handler('dont-continue');
 		}
 
 		delete_files(keys %dir_files);
@@ -265,7 +287,7 @@ sub delete_files {
 	my (@files) = @_;
 
 	my $delete_all = $opt{'delete'} ? 1 : 0;
-	for my $file (@files) {
+	for my $file (values @files) {
 		my $file = "$deps_dir/$file";
 
 		my $delete;
@@ -287,29 +309,50 @@ sub delete_files {
 	}
 }
 
+sub package_manager {
+	my ($options) = @_;
+
+	my $lock = $friendly_lock{$pm_lock};
+
+	unless (exists $options->{$lock}) {
+		# no function defined for $pm_lock
+		return;
+	}
+
+	my $action = $options->{$lock};
+	if (ref($action) eq 'CODE') {
+		$action->();
+	}
+	else {
+		error('missing ref or ref is not code');
+		error_handler('dont-continue');
+	}
+}
+
 sub lockfile {
 	my ($lockfiles, $force_git_deps, $force_empty_cache) = @_;
 
 	my @packages;
 	for my $lock (@$lockfiles) {
-		my $lock_content = Util::read_file_as($lock, 'encoding(UTF-8)');
-		for my $pkg (values @{get_packages($lock_content)}) {
+		for my $pkg (values @{ get_packages($lock) }) {
 			my $package = Package->from_lock($pkg);
-			push(@packages, $package);
+			if (defined $package) {
+				push(@packages, $package);
+			}
 		}
 	}
 
 	error_handler('no-deps') if (!@packages && !$force_empty_cache);
 
 	my @new_packages;
-	my @gits = grep {($_->{'specifics'}{'type'} eq 'git')} @packages;
+	my @gits = grep { ($_->{'specifics'}{'type'} eq 'git') } @packages;
 	if (@gits) {
 		for my $pkg (values @gits) {
 			logger("Recursively parsing lockfile for git sourced package \"$pkg->{'name'}\"...");
 
 			my $path = $pkg->{'specifics'}{'workdir'};
-			my $git_lockfile = Util::read_file_as("$path/package-lock.json", 'encoding(UTF-8)') if -e "$path/package-lock.json";
-			my $package_json = JSON::PP::decode_json(Util::read_file_as("$path/package.json", 'encoding(UTF-8)'));
+			my $git_lockfile = Util::read_file("$path/package-lock.json") if -e "$path/package-lock.json";
+			my $package_json = JSON::PP::decode_json(Util::read_file("$path/package.json"));
 			my @scripts = keys %{$package_json->{'scripts'}};
 			my @unsupported = qw/postinstall build preinstall install prepack prepare/;
 			my %seen;
@@ -329,69 +372,108 @@ sub lockfile {
 	@packages = (@packages, @new_packages);
 
 	# dedup by url again
-	my %seen;
-	@packages = grep {!$seen{$_->{'url'}}++} @packages;
+	package_manager({
+		npm => sub {
+			my %seen;
+			@packages = grep { !$seen{ $_->{'uri'} }++ } @packages;
+		}
+	});
 
 	return \@packages;
 }
 
 sub get_packages {
-	my ($decoded_lock) = JSON::PP::decode_json(@_);
+	my ($lock) = @_;
+
+	my $content = package_manager({
+		npm => sub {
+			my $data = Util::read_file($lock);
+			return JSON::PP::decode_json($data) || error_handler('lockfile-decode-fail', $lock, $!);
+		},
+		pnpm => sub {
+			my $data = Util::read_file($lock);
+			return YAML::PP::Load($data); # outputs its own error and dies
+		},
+		yarn => sub {
+			my $data = {};
+			$data->{'packages'} = {};
+
+			open(my $fh, '<:encoding(UTF-8)', $lock) or error_handler('open', $lock, "$!");
+
+			while (my $line = <$fh>) {
+				chomp($line);
+				next if $line =~ /^(?:\s*$|^#)/; # skip empty lines, comments
+
+				if ($line =~ /^(\S+@.+):$/) {
+					my $pkg_name = $1;
+
+					$data->{'packages'}{$pkg_name} = {
+						version => undef,
+						resolved => undef,
+						integrity => undef
+					};
+
+					my $package = $data->{'packages'}{$pkg_name};
+
+					# read ahead and fill in the undef
+					while (my $next_line = <$fh>) {
+						chomp($next_line);
+						last if $next_line =~ /^\S+@/ || $next_line =~ /^\s*$/;
+
+						if ($next_line =~ /^\s+version\s+"(.+)"\s?$/) {
+							$package->{'version'} = $1;
+						}
+						elsif ($next_line =~ /^\s+resolved\s+"(.+)"\s?$/) {
+							$package->{'resolved'} = $1;
+						}
+						elsif ($next_line =~ /^\s+integrity\s+(.+==)\s?$/) {
+							$package->{'integrity'} = $1;
+						}
+					}
+				}
+			}
+			return $data;
+		}
+	});
 
 	my @packages;
-	while (my ($pkg_name, $pkg) = each %{$decoded_lock->{'packages'}}) {
-		# https://docs.npmjs.com/cli/configuring-npm/package-lock-json#packages
-		my $uri = \URI->new($pkg->{'resolved'});
-		if (defined $$uri->scheme && $pkg_name ne '') {
-			$pkg->{'name'} = $pkg_name;
-			$pkg->{'uri'} = $uri;
-			push(@packages, $pkg);
+	my $count;
+	for my $pkg_name (keys %{ $content->{'packages'} }) {
+		my $pkg = $content->{'packages'}{$pkg_name};
+		my $res = package_manager({
+			npm => sub {
+				return $pkg->{'resolved'};
+			},
+			pnpm => sub {
+				return $pkg->{'resolution'};
+			},
+			yarn => sub {
+				return $pkg->{'resolved'};
+			}
+		});
+		$count++;
+
+		if ($pkg_name ne '') {
+			if (defined $res) {
+				$pkg->{'name'} = $pkg_name;
+				push(@packages, $pkg);
+			}
 		}
 	}
 
-	# dedup by url
-	my %seen;
-	@packages = grep {!$seen{$_->{'resolved'}}++} @packages;
+	#print "count: $count\n";
+	#print Dumper(scalar @packages);
+	#print Dumper(@packages);
+
+	# dedup by resolved. only required for npm
+	package_manager({
+		npm => sub {
+			my %seen;
+			@packages = grep { !$seen{ $_->{'resolved'} }++ } @packages;
+		}
+	});
 
 	return \@packages;
-}
-
-sub get_hosted_git_url {
-	my ($uri) = @_;
-
-	if ($$uri->scheme =~ m/^(git|git\+ssh|git\+https|ssh)$/) {
-		# https://metacpan.org/pod/URI#SCHEME-SPECIFIC-SUPPORT
-		# uri's with unsupported schemes can only use common and generic methods
-		my $authority = $$uri->authority;
-		if ($authority =~ m/github.com$/) {
-			my @segments = $$uri->path_segments;
-			# https://metacpan.org/pod/URI#$uri-%3Epath_segments
-			# shift the first path_segment
-			shift @segments;
-
-			my $user = shift @segments;
-			my $project = shift @segments;
-			my $type = shift @segments;
-			my $commit = shift @segments;
-
-			if (!defined $commit) {
-				$commit = $$uri->fragment;
-			}
-			elsif (defined $type && $type ne 'tree') {
-				return undef;
-			}
-
-			$project =~ s/\.git$// if $project =~ m/\.git$/;
-
-			return (
-				"https://codeload.github.com/$user/$project/tar.gz/$commit",
-				"$project-$commit.tar.gz"
-			);
-		}
-	}
-	else {
-		return undef;
-	}
 }
 
 sub error_handler {
@@ -413,53 +495,70 @@ sub error_handler {
 			$errno=4; $show_help = 1; "Select exactly one action from \"$one\"" }
 		elsif ($err eq 'select-one-option') {
 			$errno=5; $show_help = 1; "Select exactly one option from \"$one $two\"" }
-		# package-lock.json rules
+		elsif ($err eq 'option-missing-dep') {
+			$errno=6; $exit = 0; "Option \"--$one\" depends on \"--$two\". Ignoring" }
+		elsif ($err eq 'option-argument-unknown') {
+			$errno=6; $show_help = 1; "Option \"--$one\" called with unknown argument \"$two\"" }
+		# lockfile rules
 		elsif ($err eq 'no-integrity') {
 			$errno = 10; "Registry package $one missing integrity string" }
 		elsif ($err eq 'no-url') {
-			$errno = 11; "Package $one missing url" }
+			$errno = 11; "Package $one contains an unsupported url ($two)" }
 		elsif ($err eq 'no-filename') {
-			$errno = 12; "Couldn't parse a filename for package $one" }
+			$errno = 12; "Could not extract filename from url for package $one ($two)" }
 		elsif ($err eq 'git-deps-lockfile') {
-			$errno = 13; "Git dependency $one contains install scripts and no lockfile. This will probably break.\nIf you want to try to use this dependency, set forceGitDeps" }
+			$errno = 13; "Git dependency $one contains install scripts and no lockfile. This will probably break.\nIf you want to try to use this dependency, set FORCE_GIT_DEPS" }
 		elsif ($err eq 'no-deps') {
 			$errno = 14; "No cacheable dependencies were found. Please check package-lock.json and verify that it has \"resolved\" URLs \"integrity\" hashes.\nIf generating an empty cache is intentional, set forceEmptyCache." }
 		elsif ($err eq 'lock-version-unsupported') {
 			$errno = 15; "lockfileVersion $one is unsupported" }
+		elsif ($err eq 'no-hosted-url') {
+			$errno = 16; "Package $one contains an unsupported git host or malformed url ($two)" }
+		elsif ($err eq 'lockfile-pm-mismatch') {
+			$errno = 17; "Expecting lockfile $one but found $two." }
+		elsif ($err eq 'lockfile-decode-fail') {
+			$errno = 18; "Cannot decode file $one \nError: $two"}
+		elsif ($err eq 'no-uri') {
+			$errno = 19; "Package $one contains an unsupported or malformed url ($two)"}
+		# package manager rules
+		elsif ($err eq 'pm-unsupported') {
+			$errno = 25; "Cannot decode file $one \nError: $two"}
 		# file rules
 		elsif ($err eq 'open') {
-			$errno = 20; "Cannot open file $one \nError: $two" }
+			$errno = 30; "Cannot open file $one \nError: $two" }
 		elsif ($err eq 'create') {
-			$errno = 21; "Cannot create file $one \nError: $two" }
+			$errno = 31; "Cannot create file $one \nError: $two" }
 		elsif ($err eq 'write') {
-			$errno = 22; "Cannot write to file $one \nError: $two" }
+			$errno = 32; "Cannot write to file $one \nError: $two" }
 		elsif ($err eq 'remove') {
-			$errno = 23; "Cannot remove file $one \nError: $two" }
+			$errno = 33; "Cannot remove file $one \nError: $two" }
 		elsif ($err eq 'mkdir') {
-			$errno = 24; "Cannot create directory $one \nError: $two" }
+			$errno = 34; "Cannot create directory $one \nError: $two" }
 		elsif ($err eq 'open-dir-failed') {
-			$errno = 25; "Cannot open directory $one \nError: $two" }
+			$errno = 35; "Cannot open directory $one \nError: $two" }
 		elsif ($err eq 'dir-not-empty') {
-			$errno = 26; "$one directory is not empty" }
+			$errno = 36; "$one directory is not empty" }
+		elsif ($err eq 'file-not-found') {
+			$errno = 37; "$one file not found" }
+		elsif ($err eq 'dir-not-found') {
+			$errno = 38; "$one directory not found" }
 		elsif ($err eq 'symlink') {
-			$errno = 27; "Cannot symlink file to $one \nError: $two" }
+			$errno = 39; "Cannot symlink file to $one \nError: $two" }
 		# download rules
 		elsif ($err eq 'download-error') {
-			$errno = 30; "Error downloading file: $one \nError: $two" }
-		elsif ($err eq 'not-download-action') {
-			$errno = 31; "Cannot download missing files with this action"}
+			$errno = 40; "Error downloading URL: $one \nError: $two" }
 		elsif ($err eq 'download-file-exists') {
-			$errno = 32; $exit = 0; "File $one already exists. Skipping" }
+			$errno = 41; $exit = 0; "File $one already exists. Skipping" }
 		# verify rules
 		elsif ($err eq 'verify-mismatch') {
-			$errno = 40; $exit = 0; "Mismatching integrity for package: $one \n$two" }
+			$errno = 50; $exit = 0; "Mismatching integrity for package: $one \n$two" }
 		elsif ($err eq 'invalid-algo') {
-			$errno = 41; "Invalid hash algorithm: $one \nValid algorithms: $two" }
+			$errno = 51; "Invalid hash algorithm: $one \nValid algorithms: $two" }
 		elsif ($err eq 'system-tar') {
-			$errno = 50; "System call to tar failed with arguments:\n$one" }
+			$errno = 60; "System call to tar failed with arguments:\n$one" }
 		# signals/user input
 		elsif ($err eq 'caught-signal') {
-			$errno = 60; "\nCaught signal. Cleaning up...\n$one" }
+			$errno = 70; "\nCaught signal. Cleaning up...\n$one" }
 		elsif ($err eq 'dont-continue') {
 			# the script should print a warning message with explanation before 
 			# getting here. exit with 0 and no message
@@ -478,8 +577,7 @@ sub show_options {
 }
 
 sub show_version {
-	use File::Basename;
-	my $prog = basename($0);
+	my $prog = File::Basename::basename($0);
 	print(<<"__EOS__");
 $prog version: v$VERSION
 Using Perl version: $^V
@@ -504,7 +602,7 @@ sub logger {
 sub warning {
 	my ($str) = @_;
 
-	print "$warn_prefix $str\n";
+	warn "$warn_prefix $str\n";
 }
 
 sub error {
@@ -522,28 +620,301 @@ sub trap_cleanup {
 {
 package Package;
 
+# git url's in package-lock.json are sshurl or https url:
+# https://github.com/npm/pacote/blob/4b559c4c663a23f988f6be5094c9a45faf6231bc/lib/git.js#L21
+# https://github.com/npm/hosted-git-info/blob/main/lib/hosts.js
+# only these sites (the ones that offer archive download) are supported for now
+sub _get_hosted_git_url {
+	my ($uri) = @_;
+
+	my @segments = $uri->path_segments;
+	# https://metacpan.org/pod/URI#$uri-%3Epath_segments
+	# shift the first path_segment
+	shift @segments;
+
+	# https://metacpan.org/pod/URI#SCHEME-SPECIFIC-SUPPORT
+	# uri's with unsupported schemes can only use common and generic methods
+	my $authority = $uri->authority;
+	if ($authority =~ m/github\.com$/) {
+		my $user = shift @segments;
+		my $project = shift @segments;
+		my $type = shift @segments;
+		my $commit = shift @segments;
+
+		if (!defined $commit) {
+			$commit = $uri->fragment;
+		}
+		elsif (defined $type && $type ne 'tree') {
+			return undef;
+		}
+
+		$project =~ s/\.git$//;
+
+		return "https://codeload.github.com/$user/$project/tar.gz/$commit";
+	}
+	elsif ($authority =~ m/bitbucket.org$/) {
+		my $user = shift @segments;
+		my $project = shift @segments;
+		my $aux = shift @segments;
+
+		if (defined $aux && $aux eq 'get') {
+			return undef;
+		}
+
+		$project =~ s/\.git$//;
+
+		my $commit = $uri->fragment;
+
+		return "https://bitbucket.org/$user/$project/get/$commit.tar.gz";
+	}
+	elsif ($authority =~ m/gitlab.com$/) {
+		my $path = $uri->path;
+		if ($path =~ m/\/-\// || $path =~ m/\/archive\.tar\.gz/) {
+			return undef;
+		}
+
+		my $user = shift @segments;
+		my $project = shift @segments;
+
+		$project =~ s/\.git$//;
+
+		my $commit = $uri->fragment;
+
+		return "https://gitlab.com/api/v4/projects/$user%2F$project/repository/archive.tar.gz?ref=$commit";
+	}
+
+	return undef;
+}
+
+sub _get_hosted_git_filename {
+	my ($uri) = @_;
+
+	my $host = $uri->host;
+	my $path = $uri->path_query;
+
+	if ($host eq 'codeload.github.com') {
+		if ($path =~ m|^/([^/]+)/([^/]+)/tar\.gz/([^/]+)$|) {
+			my ($user, $project, $commit) = ($1, $2, $3);
+			return "$project-$commit.tar.gz";
+		}
+	} elsif ($host eq 'bitbucket.org') {
+		if ($path =~ m|^/([^/]+)/([^/]+)/get/([^/]+)\.tar\.gz$|) {
+			my ($user, $project, $commit) = ($1, $2, $3);
+			return "$project-$commit.tar.gz";
+		}
+	} elsif ($host eq 'gitlab.com') {
+		if ($path =~ m|^/api/v4/projects/([^/]+)%2F([^/]+)/repository/archive.tar.gz\?ref=([^&]+)|) {
+			my ($user, $project, $commit) = ($1, $2, $3);
+			return "$project-$commit.tar.gz";
+		}
+	}
+
+	return undef;
+}
+
+sub _is_hosted_git_url {
+	my ($url) = @_;
+
+	return (
+		$url =~ m|^https://codeload\.github\.com| ||
+		$url =~ m|^https://bitbucket\.org| ||
+		$url =~ m|^https://gitlab\.com|
+	) && $url =~ m/tar.gz/;
+}
+
+sub _is_registry_url {
+	my ($url) = @_;
+
+	return (
+		$url =~ m|^https://registry\.npmjs\.org| ||
+		$url =~ m|^https://registry\.yarnpkg\.com|
+	) && $url =~ m/tgz/;
+}
+
+sub _get_registry_url_from_name {
+	my ($pkg_name) = @_;
+
+	# @typescript-eslint/visitor-keys@8.40.0
+	# anymatch@3.1.3
+	if ($pkg_name =~ m|^(@[^/]+/)?([^/]+)@([^/]+)$|) {
+		my ($scope, $package, $version) = ($1 || '', $2, $3);
+		if ($scope) {
+			return "https://registry.npmjs.org/$scope$package/-/$package-$version.tgz";
+		}
+		else {
+			return "https://registry.npmjs.org/$package/-/$package-$version.tgz";
+		}
+	}
+	else {
+		return undef;
+	}
+}
+
+sub _get_res_url {
+	my ($pkg_name, $res, $integrity, $pkg) = @_;
+
+	my $url = main::package_manager({
+		npm => sub {
+			if ($res =~ m/^(git|git\+ssh|git\+https|ssh):\/\/(.*)/) {
+				my $hosted = _get_hosted_git_url(URI->new($res));
+				unless ($hosted) {
+					main::error_handler('no-hosted-url', $pkg_name, $res);
+				}
+				return $hosted;
+			}
+			elsif ($res =~ m/^file:/ || defined $pkg->{'link'}) {
+				# linked directories don't include the file: prefix
+				$res =~ s/^file://;
+				my $file = Util::make_abs_to_project_dir($res);
+				return "file://$file";
+			}
+			else {
+				return $res;
+			}
+		},
+		pnpm => sub {
+			# https://github.com/pnpm/pnpm/tree/main/resolving
+			# https://github.com/pnpm/pnpm/tree/main/fetching/pick-fetcher
+			my $tarball = $res->{'tarball'};
+			my $type = $res->{'type'};
+			if (!defined $type) {
+				if (!defined $tarball) {
+					if (defined $integrity) {
+						# npm registry
+						return _get_registry_url_from_name($pkg_name);
+					}
+					else {
+						main::error_handler('no-integrity', $pkg_name)
+					}
+				}
+				else {
+					if (_is_hosted_git_url($tarball)) {
+						# hosted tarball (github, bitbucket etc)
+						print "found hosted $tarball\n";
+						return $tarball;
+					}
+					elsif ($tarball =~ m/^file:/) {
+						# local tarball. make it absolute
+						$tarball =~ s/^file://;
+						my $file = Util::make_abs_to_project_dir($tarball);
+						print "found file $file\n";
+						return "file://$file";
+					}
+					else {
+						# a tarball from an unknown source. warn
+						warning("Warning: package \"$pkg_name\" is using an unknown source");
+						return $tarball;
+					}
+				}
+			}
+			else {
+				if ($type eq 'git') {
+					# it appears that only repo and commit are defined:
+					# https://github.com/pnpm/pnpm/blob/main/fetching/git-fetcher/test/index.ts
+					# add support when required
+					#my $repo = $resolution->{'repo'};
+					#my $commit = $resolution->{'commit'};
+					main::error("Unsupported package type for package \"$pkg_name\"");
+					die;
+				}
+				elsif ($type eq 'directory') {
+					my $dir = Util::make_abs_to_project_dir($res->{'directory'});
+					print "found dir $dir\n";
+					return "file://$dir";
+				}
+				elsif ($type eq 'bin') {
+					# unsupported for now
+					# https://github.com/pnpm/pnpm/blob/main/fetching/binary-fetcher/src/index.ts
+					main::error("Unsupported package type for package \"$pkg_name\"");
+					die;
+				}
+				else {
+					main::error("Unknown package type for package \"$pkg_name\"");
+					die;
+				}
+			}
+		},
+		yarn => sub {
+			if ($res =~ m/^(git|git\+ssh|git\+https|ssh):\/\/(.*)/) {
+				my $hosted = _get_hosted_git_url(URI->new($res));
+				unless ($hosted) {
+					main::error_handler('no-hosted-url', $pkg_name, $res);
+				}
+				return $hosted;
+			}
+			else {
+				return $res;
+			}
+		}
+	});
+
+	return $url || '';
+}
+
+# notes:
+# pnpm provides the relevant git hosted url if site supports it
+# pnpm tarball packages have integrity only when they're local (i.e. type)
+# pnpm removes .git directory when package is git hosted
 sub from_lock {
 	my $class = shift;
 
 	my ($pkg) = @_;
 
-	my ($resolved, $uri) = ($pkg->{'resolved'}, $pkg->{'uri'});
-	my ($hosted, $filename) = main::get_hosted_git_url($uri);
-	my %specifics;
+	my $pkg_name = $pkg->{'name'};
+	my ($res, $integrity) = main::package_manager({
+		npm => sub {
+			return ($pkg->{'resolved'}, $pkg->{'integrity'} || '');
+		},
+		pnpm => sub {
+			return ($pkg->{'resolution'}, $pkg->{'resolution'}{'integrity'} || '');
+		},
+		yarn => sub {
+			return ($pkg->{'resolved'}, $pkg->{'integrity'} || '');
+		}
+	});
 
-	if (!$hosted) {
-		# filename must include the scope to avoid clobbering later
+	my %specifics;
+	my $filename;
+
+	my $url = _get_res_url($pkg_name, $res, $integrity, $pkg);
+	my $uri = URI->new($url);
+	unless (defined $uri->scheme) {
+		main::error_handler('no-uri', $pkg_name, $url)
+	}
+
+	if (_is_registry_url($uri)) {
+		# filename must include the scope to avoid clobbering
 		# https://docs.npmjs.com/about-scopes
-		my @segments = $$uri->path_segments;
+		my @segments = $uri->path_segments;
 		$filename = ($segments[1] =~ m/^@/) ? "$segments[1]_$segments[-1]" : "$segments[-1]";
+
+		# strip sum fragment from yarn urls
+		main::package_manager({
+			yarn => sub {
+				$uri->fragment(undef);
+			}
+		});
+
+		my $integrity = Util::integrity_to_best($integrity);
+		unless ($integrity) {
+			main::error_handler('no-integrity', $pkg_name);
+		}
 
 		%specifics = (
 			'type' => 'registry',
-			'integrity' => Util::integrity_to_best($pkg->{'integrity'}) || main::error_handler('no-integrity', $pkg->{'name'}),
+			'integrity' => $integrity,
 		);
 	}
-	else {
-		my $data = Util::fetch($filename, $hosted);
+	elsif (_is_hosted_git_url($uri)) {
+		$filename = _get_hosted_git_filename($uri);
+
+		my $data;
+		if (! -e "$deps_dir/$filename") {
+			$data = Util::fetch($uri);
+		}
+		else {
+			$data = Util::read_file("$deps_dir/$filename", 'raw');
+		}
 
 		my $workdir = File::Temp->newdir('packageXXXX', 'CLEANUP' => $opt{'cleanup'});
 
@@ -557,22 +928,53 @@ sub from_lock {
 		main::run3(\@cmd, \$data, \undef);
 		main::error_handler('system-tar', join(' ', @cmd)) if $?;
 
-		$resolved = $hosted;
 		%specifics = (
 			'type' => 'git',
 			'workdir' => $workdir,
 		);
 	}
+	elsif ($uri->scheme eq 'file') {
+		# though we're not processing the files/directories, warn about them not
+		# existing
+		my $path = $uri->path;
+		unless (-e $path) {
+			main::warning("Missing dependency for package $pkg_name ($path)");
+			#main::error_handler('file-not-found', $path);
+		}
+
+		#$filename = File::Basename::basename($path);
+
+		#%specifics = (
+		#	'type' => 'file'
+		#);
+
+		return undef;
+	}
+
+	unless ($filename) {
+		main::error_handler('no-filename', $pkg_name, $uri);
+	}
 
 	my $self = {
-		'name' => $pkg->{'name'},
-		'filename' => $filename || main::error_handler('no-filename', $pkg->{'name'}),
-		'uri' => $$uri,
-		'url' => $resolved || main::error_handler('no-url', $pkg->{'name'}),
+		'name' => $pkg_name,
+		'filename' => $filename,
+		'uri' => $uri,
 		'specifics' => \%specifics,
 	};
 
 	return bless $self, $class;
+}
+
+sub get {
+	my $self = shift;
+
+	my $file = "$deps_dir/$self->{'filename'}";
+	if (! -e $file) {
+		return Util::fetch($self->{'uri'});
+	}
+	else {
+		return Util::read_file($file, 'raw');;
+	}
 }
 
 sub verify {
@@ -580,37 +982,43 @@ sub verify {
 
 	my ($data) = @_;
 
-	if ($self->{'specifics'}{'type'} eq 'registry') {
-		my $integrity = $self->integrity();
-		if ($integrity) {
-			my ($algo, $int_hex) = Util::integrity_to_hex($integrity);
-			my $file_hex = do {
-				my $sha = Digest::SHA->new($algo);
-				$sha->add($data);
-				$sha->hexdigest;
-			};
-			if ($int_hex ne $file_hex) {
-				main::error_handler('verify-mismatch', $self->{'name'}, "Integrity: $int_hex\nFile:      $file_hex");
-				return 0;
-			}
-			main::logger("Successfully verified $self->{'url'}");
-			return 1;
-		}
-		else {
-			main::error_handler('no-integrity', $self->{'name'});
-		}
-	}
-	elsif ($self->{'specifics'}{'type'} eq 'git') {
-		# git packages don't have integrity strings
+	my $integrity = $self->integrity();
+
+	if ($self->{'specifics'}{'type'} eq 'git') {
+		# git packages shouldn't have integrity strings
 		# default to success
 		return 1;
+	}
+	elsif ($self->{'specifics'}{'type'} eq 'file' && !$integrity) {
+		# for local files that don't have an integrity, default to success
+		return 1;
+	}
+
+	$data //= $self->get();
+
+	if ($integrity) {
+		my ($algo, $int_hex) = Util::integrity_to_hex($integrity);
+		my $file_hex = do {
+			my $sha = Digest::SHA->new($algo);
+			$sha->add($data);
+			$sha->hexdigest;
+		};
+		if ($int_hex ne $file_hex) {
+			main::error_handler('verify-mismatch', $self->{'name'}, "Integrity: $int_hex\nFile:      $file_hex");
+			return 0;
+		}
+		main::logger("Successfully verified $self->{'uri'}");
+		return 1;
+	}
+	else {
+		main::error_handler('no-integrity', $self->{'name'});
 	}
 }
 
 sub integrity {
 	my $self = shift;
 
-	return $self->{'specifics'}{'integrity'} ? $self->{'specifics'}{'integrity'} : 0
+	return defined $self->{'specifics'}{'integrity'} ? $self->{'specifics'}{'integrity'} : 0
 }
 }
 
@@ -640,14 +1048,13 @@ sub init {
 	Path::make_path($$self->join('index-v5'));
 }
 
-# symlinks tarballs into a cacache structure, then writes an index entry for them
+# symlinks tarballs into a cacache structure, then writes a metadata entry for them
 sub put {
 	my $self = shift;
 
 	my ($key, $url, $file, $integrity) = @_;
 
-	my ($algo, $hex, $filesize);
-
+	my ($algo, $hex);
 	if ($integrity) {
 		($algo, $hex) = Util::integrity_to_hex($integrity);
 	}
@@ -664,8 +1071,6 @@ sub put {
 		$hex = $sha->hexdigest;
 		$integrity = "$algo" . '-' . "$b64_digest";
 	}
-
-	$filesize = -s $file;
 
 	my $content_path = do {
 		my $path = $$self->join('content-v2');
@@ -686,14 +1091,14 @@ sub put {
 	Path::make_path($index_path->parent());
 
 	my $json_data = JSON::PP::encode_json({
-		'key' => $key,
-		'integrity' => $integrity,
-		'time' => 0,
-		'size' => $filesize,
-		'metadata' => {
-			'url' => $url,
-			'options' => {
-				'compress' => JSON::PP::true
+		key => $key,
+		integrity => $integrity,
+		time => 0,
+		size => -s $file,
+		metadata => {
+			url => $url->as_string,
+			options => {
+				compress => JSON::PP::true
 			}
 		}
 	});
@@ -709,7 +1114,7 @@ package Path;
 sub _cleanup_path_strings {
 	my (@strings) = @_;
 
-	map {s/^\/|\/$//g} @strings;
+	map { s/^\/|\/$//g } @strings;
 	return join('/', @strings);
 }
 
@@ -816,7 +1221,7 @@ sub integrity_to_hex {
 	my ($integrity) = @_;
 
 	my ($algo, $b64_str) = integrity_split($integrity);
-	return ($algo, join('', (unpack("H*", MIME::Base64::decode_base64($b64_str)))));
+	return ($algo, join('', (unpack('H*', MIME::Base64::decode_base64($b64_str)))));
 }
 
 sub integrity_split {
@@ -833,37 +1238,113 @@ sub integrity_split {
 }
 
 sub fetch {
-	my ($filename, $url) = @_;
+	my ($url) = @_;
 
-	if (! -e "$deps_dir/$filename" && $url) {
-		main::error_handler('not-download-action') if !$act{'download'} && !$act{'uris'};
-
-		main::logger("Downloading " . $url);
-		my $ua = LWP::UserAgent->new();
-		my $retries;
-		{
-			++$retries;
-			my $response = $ua->get("$url");
-			if ($response->is_success) {
-				return $response->content;
-			}
-			else {
-				sleep 2;
-				redo if $retries < 3;
-			}
-			main::error_handler('download-error', $url, $response->status_line);
-		}
+	unless ($act{'download'} || $act{'uris'}) {
+		main::error_handler('download-error', $url, 'This is not a download action');
 	}
-	else {
-		return read_file_as("$deps_dir/$filename", 'raw');;
+
+	main::logger("Downloading $url");
+	my $ua = LWP::UserAgent->new();
+	my $retries;
+	{
+		++$retries;
+		my $response = $ua->get($url);
+		if ($response->is_success) {
+			return $response->content;
+		}
+		else {
+			sleep 2;
+			redo if $retries < 3;
+		}
+		main::error_handler('download-error', $url, $response->status_line);
 	}
 }
 
-sub read_file_as {
+# find $filename in $dir to the desired $depth
+# can be provided an array of items to exclude
+sub find_file {
+	my ($filename, $dir, $max_depth, @exclude_list) = @_;
+
+	if (defined $dir) {
+		# $project_dir and $cwd are already valid absolute paths by the time we get
+		# here, but leave these in place for potential repurposing later
+		unless (-d $dir) {
+			main::error_handler('dir-not-found', $dir);
+		}
+
+		$dir = File::Spec->rel2abs($dir);
+	}
+	else {
+		$dir = $project_dir;
+	}
+	my $dir_len = $dir =~ tr[/][];
+
+	my %exclude_hash;
+	if (@exclude_list) {
+		# prepend $dir to exclude_list since it's what File::Find is called with
+		%exclude_hash = map { File::Spec->catfile($dir, $_) => 1 } @exclude_list;
+	}
+
+	my @results;
+	File::Find::find({
+		preprocess => sub {
+			# remove entire directory trees if in %exclude_hash
+			if (exists $exclude_hash{$File::Find::dir}) {
+				main::logger("Excluding directory \"$File::Find::dir\"");
+				return;
+			}
+
+			if (defined $max_depth) {
+				# print "depth: $File::Find::dir =~ tr[/][] | max_depth: $max_depth | dir_len: $dir_len | dir: $File::Find::dir\n";
+				my $depth = $File::Find::dir =~ tr[/][] - $dir_len;
+				if ($depth < $max_depth) {
+					return @_;
+				}
+				if ($depth == $max_depth) {
+					return grep { ! -d } @_;
+				}
+			}
+			else {
+				return @_;
+			}
+		},
+		wanted => sub {
+			if (-f && ($_ eq $filename)) {
+				# process out the individual files
+				unless (exists $exclude_hash{$File::Find::name}) {
+					main::logger("Found file \"$File::Find::name\"");
+					push(@results, $File::Find::name);
+					return;
+				}
+				main::logger("Excluding file \"$File::Find::name\"");
+				return;
+			}
+		},
+	}, $dir);
+
+	return @results;
+}
+
+sub make_abs_to_project_dir {
+	my ($path) = @_;
+
+	$path = File::Spec->rel2abs($path, $project_dir);
+	# attempt to resolve any relative path components (. and ..)
+	# caveat: it checks if the path exists. don't error here
+	$path = Cwd::abs_path($path) || $path; 
+
+	return $path
+}
+
+sub read_file {
 	my ($file, $encoding) = @_;
+	# default to :encoding(UTF-8) instead of simply :utf-8. this is to check if
+	# the data is valid utf-8. see https://metacpan.org/pod/PerlIO::encoding
+	$encoding //= 'encoding(UTF-8)';
 
 	my $data = do {
-		open(my $fh, "<:$encoding", $file) or main::error_handler('open', $file, "$!");
+		open(my $fh, "<:$encoding", $file) or main::error_handler('open', $file, $!);
 		local $/; # slurp entire file
 		<$fh>
 	};
@@ -873,15 +1354,16 @@ sub read_file_as {
 sub write_file {
 	my ($file, $data) = @_;
 
-	open(my $fh, '>:raw', "$file") or error_handler('open', "$file", "$!");
+	open(my $fh, '>:raw', $file) or main::error_handler('write', $file, $!);
 	print $fh $data;
 	close $fh;
 }
 
 sub is_empty_dir {
 	my ($dir) = @_;
-	opendir(my $dh, $dir) or main::error_handler('open-dir-failed', $dir, "$!");
-	my $count = scalar(grep {$_ ne '.' && $_ ne '..'} readdir($dh));
+
+	opendir(my $dh, $dir) or main::error_handler('open-dir-failed', $dir, $!);
+	my $count = scalar(grep { $_ ne '.' && $_ ne '..' } readdir($dh));
 	closedir $dh;
 	return $count == 0;
 }
@@ -894,7 +1376,7 @@ sub prompt {
 	my $response;
 	while ($response = <STDIN>) {
 		chomp $response;
-		last if grep {$_ eq $response} @accepted;
+		last if grep { $_ eq $response } @accepted;
 		if ($response eq '') {
 			$response = undef;
 			last;
@@ -921,13 +1403,16 @@ sub prompt_yn {
 package OptionsHandler;
 
 sub get {
-	my $count = 0;
 	Getopt::Long::GetOptions(
+	# 'options'
 	'pack' => sub {
 		$opt{'pack'} = 1; },
-	'lockfile=s' => \$opt{'lockfile'},
+	'pm=s' => \$opt{'pm'},
+	'project-dir=s' => \$opt{'project-dir'},
+	'deps-dir=s' => \$opt{'deps-dir'},
 	'find' => sub {
 		$opt{'find'} = 1; },
+	'depth=i' => \$opt{'depth'},
 	'exclude=s@' => \$opt{'exclude'},
 	'update' => sub {
 		$opt{'update'} = 1; },
@@ -946,6 +1431,7 @@ sub get {
 	'v|version' => sub {
 		$opt{'version'} = 1; },
 	'<>' => sub {
+		# 'actions'
 		my ($arg) = @_;
 
 		if ($arg eq 'fixup-lockfile') {
@@ -954,8 +1440,8 @@ sub get {
 			$act{'download'} = 1; }
 		elsif ($arg eq 'uris') {
 			$act{'uris'} = 1; }
-		elsif ($arg eq 'cacache') {
-			$act{'cacache'} = 1;
+		elsif ($arg eq 'cache') {
+			$act{'cache'} = 1;
 			$opt{'no-delete'} = 1; }
 		elsif ($arg eq 'verify-files') {
 			$act{'verify-files'} = 1; }
@@ -976,6 +1462,42 @@ sub post_process {
 
 	$opt{'verify'} = $opt{'no-verify'} ? 0 : 1;
 	$opt{'cleanup'} = $opt{'no-cleanup'} ? 0 : 1;
+
+	if ($opt{'pm'}) {
+		my $match;
+		for my $lock (keys %friendly_lock) {
+			if ($friendly_lock{$lock} eq $opt{'pm'}) {
+				$match = $lock;
+			}
+		}
+
+		if ($match) {
+			$pm_lock = $match;
+		}
+		else {
+			main::error_handler('option-argument-unknown', 'pm', $opt{'pm'})
+		}
+	}
+	else {
+		# default to npm
+		$pm_lock = $npm_lock;
+	}
+
+	$cache_dir = $opt{'cache-dir'} ? File::Spec->rel2abs($opt{'cache-dir'}) : "$cwd/$friendly_lock{$pm_lock}-cache";
+	$cache_dir = $ENV{'CACHE_DIR'} || $cache_dir;
+
+	$deps_dir = $opt{'deps-dir'} ? File::Spec->rel2abs($opt{'deps-dir'}) : "$cwd/$friendly_lock{$pm_lock}-deps";
+	$deps_dir = $ENV{'DEPS_DIR'} || $deps_dir;
+
+	# rel2abs will always return an absolute path. it doesn't perform filesystem
+	# checks however
+	$project_dir = $opt{'project-dir'} ? File::Spec->rel2abs($opt{'project-dir'}) : $cwd;
+	$project_dir = $ENV{'PROJECT_DIR'} || $project_dir;
+	unless (-d $project_dir) {
+		main::error_handler('dir-not-found', $project_dir);
+	}
+
+	$lock = lockfile_sanity_check();
 }
 
 sub option_consistency_checks {
@@ -986,9 +1508,38 @@ sub option_consistency_checks {
 	if ($acts > 1) {
 		main::error_handler('select-one-action', join(', ', keys %act))
 	}
-	if ($opt{'lockfile'} && $opt{'find'}) {
-		main::error_handler('select-one-option', "--lockfile", "--find");
+
+	# --depth and --exclude require --find option. give a no-exit error
+	unless ($opt{'find'}) {
+		my $option;
+		$option = 'depth' if defined $opt{'depth'};
+		$option = 'exclude' if defined $opt{'exclude'};
+
+		if (defined $option) {
+			main::error_handler('option-missing-dep', $option, 'find');
+		}
 	}
+}
+
+# check $project_dir to ensure the correct lockfile for the desired package
+# manager.
+# expects lockfiles to be the standard name. filename variations are not
+# supported
+sub lockfile_sanity_check {
+	# find the lockfile in $project_dir
+	my @found = Util::find_file($pm_lock, $project_dir, 0, @{$opt{'exclude'}});
+	if (scalar @found == 0) {
+		# no lockfile. maybe the user forgot '--pm'
+		for my $lock (keys %friendly_lock) {
+			@found = Util::find_file($lock, $project_dir, 0, @{$opt{'exclude'}});
+			if (scalar @found != 0) {
+				main::error_handler('lockfile-pm-mismatch', $pm_lock, $lock);
+			}
+		}
+		main::error_handler('file-not-found', File::Spec->catfile($project_dir, $pm_lock));
+	}
+
+	return $found[0];
 }
 }
 
@@ -1001,34 +1552,54 @@ __END__
 npm-deps [action] [options]
 
   Actions:
-    fixup-lockfile  Fix potential issues in package-lock.json
+    fixup-lockfile  Fix potential issues in the lockfile (currently npm only)
+
     download        Download and verify all dependency archives
         --pack          Tarball dependencies into a single archive once download
                         is complete
-        --update        Only download the required dependencies and verify existing
-                        dependency integrities.
+        --update        Only download the required dependencies and verify
+                        existing dependency integrities.
                         Also asks to delete any files not found in the updated
                         lockfile
         --no-verify     Disable dependency integrity checks
         --no-cleanup    Don't delete tmpdirs created for git based dependencies
 
-    uris            Processes package-lock.json as would the download action, but
+    uris            Processes the lockfile as would the download action, but
                     only print the URLs in a format compatible with Portage's
                     SRC_URI variable
-    cacache         Generate an npm compatible cacache structure
-    verify-files    Verify downloaded archives against package-lock.json's 
-                    integrity string
+
+    cache           Generate cache structure compatible with the target package
+                    manager
+        --cache-dir     Set the directory where the cache structure will be
+                        generated. This path is relative to the current working
+                        directory
+
+    verify-files    Verify downloaded archives against the lockfile's integrity
+                    string
 
   General options:
-    --lockfile      Set the location of package-lock.json file
-    --find          Descend into the current working directory and find all files
-                    titled package-lock.json, then run the action and combine the
-                    output
-    --exclude       Used in conjunction with --find. Exclude a package-lock.json
-                    file or directory tree. Can be used multiple times
-    --verbose       Show what's happening
-    --delete        Delete mismatched/extraneous dependencies and don't ask to do it
+    --pm            Select the desired Node.js package manager. Choose from
+                    npm, pnpm or yarn. If this option is not provided, the
+                    action will default to npm
+    --project-dir   Set the Node.js project directory (where the lockfile is
+                    located)
+    --deps-dir      Set the directory where dependency tarballs are to be
+                    stored. This path is relative to the current working
+                    directory
+
+    --find          Descend into the project directory and find all lockfiles,
+                    then run the action and combine the output
+        --depth         Sets the maximum depth to descend
+        --exclude       Exclude a lockfile or directory tree. Can be used
+                        multiple times. Paths are relative to the project 
+                        directory if --project-dir is defined, otherwise they
+                        are relative to the current working directory
+
+    --delete        Delete mismatched/extraneous dependencies and don't ask to
+                    do it
     --no-delete     Don't delete mismatched/extraneous dependencies
+
+    --verbose       Show what's happening
     -h, --help      Show this help message
     -V, --version   Show script version
 =cut
