@@ -41,7 +41,7 @@ use Pod::Usage qw(pod2usage);
 
 use Data::Dumper;
 
-our $VERSION = 2.0;
+our $VERSION = 2.01;
 
 # cleanup on signal
 for my $signal (qw/HUP INT QUIT TERM/) {
