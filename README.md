@@ -1,1 +1,1 @@
-A helper script for npm based Gentoo ebuilds
+A helper script for NodeJS based Gentoo ebuilds
