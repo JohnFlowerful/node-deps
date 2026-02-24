@@ -790,14 +790,12 @@ sub _get_res_url {
 				else {
 					if (_is_hosted_git_url($tarball)) {
 						# hosted tarball (github, bitbucket etc)
-						print "found hosted $tarball\n";
 						return $tarball;
 					}
 					elsif ($tarball =~ m/^file:/) {
 						# local tarball. make it absolute
 						$tarball =~ s/^file://;
 						my $file = Util::make_abs_to_project_dir($tarball);
-						print "found file $file\n";
 						return "file://$file";
 					}
 					else {
@@ -819,7 +817,6 @@ sub _get_res_url {
 				}
 				elsif ($type eq 'directory') {
 					my $dir = Util::make_abs_to_project_dir($res->{'directory'});
-					print "found dir $dir\n";
 					return "file://$dir";
 				}
 				elsif ($type eq 'bin') {
