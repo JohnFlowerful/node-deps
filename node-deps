@@ -1405,6 +1405,7 @@ sub get {
 	'pack' => sub {
 		$opt{'pack'} = 1; },
 	'pm=s' => \$opt{'pm'},
+	'cache-dir=s' => \$opt{'cache-dir'},
 	'project-dir=s' => \$opt{'project-dir'},
 	'deps-dir=s' => \$opt{'deps-dir'},
 	'find' => sub {
