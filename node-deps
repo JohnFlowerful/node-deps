@@ -114,7 +114,7 @@ sub main {
 					error_handler('dir-not-empty', $deps_dir);
 				}
 
-				my ($found, $not_found) = compare_dir_to_lockfile($deps_dir, @$packages);
+				my ($found, $not_found) = compare_deps_dir_to_lockfile(@$packages);
 
 				@$packages = @$not_found;
 
@@ -184,7 +184,16 @@ sub main {
 			if ($pm_lock ne $npm_lock) {
 				return show("Action unsupported for $friendly_lock{$pm_lock}. Skipping");
 			}
-			my ($found, $not_found) = compare_dir_to_lockfile($deps_dir, @$packages);
+
+			unless (-d $deps_dir) {
+				main::error('Missing dependency directory');
+				main::error_handler('dir-not-found', $deps_dir);
+			}
+
+			my ($found, $not_found) = compare_deps_dir_to_lockfile(@$packages);
+			if ($not_found) {
+				warning("Missing dependency tarballs in $deps_dir");
+			}
 
 			my $dir = Path->new("$cache_dir/_cacache");
 			Path::make_path($dir);
@@ -199,7 +208,12 @@ sub main {
 		}
 
 		elsif ($act{'verify-files'}) {
-			my ($found, $not_found) = compare_dir_to_lockfile($deps_dir, @$packages);
+			unless (-d $deps_dir) {
+				main::error('Missing dependency directory');
+				main::error_handler('dir-not-found', $deps_dir);
+			}
+
+			my ($found, $not_found) = compare_deps_dir_to_lockfile(@$packages);
 
 			my $bad = 0;
 			for my $pkg (values @$found) {
@@ -244,15 +258,15 @@ sub fixup_lockfile {
 	return $fixed ? \$decoded_lock : undef;
 }
 
-sub compare_dir_to_lockfile {
+sub compare_deps_dir_to_lockfile {
 	# splits the list of @packages into @not_found (for downloading) and
 	# @found (for verifying)
 	# finally asks to delete
-	my ($dir, @packages) = @_;
+	my (@packages) = @_;
 
 	my (%pkg_files, %dir_files);
 	%pkg_files = map { $_->{'filename'} => $_ } @packages;
-	find(sub {-f && ($dir_files{$_} = 1)}, $dir);
+	File::Find::find(sub {-f && ($dir_files{$_} = 1)}, $deps_dir);
 
 	# compare
 	my (@found, @not_found);
@@ -1492,6 +1506,7 @@ sub post_process {
 	$project_dir = $opt{'project-dir'} ? File::Spec->rel2abs($opt{'project-dir'}) : $cwd;
 	$project_dir = $ENV{'PROJECT_DIR'} || $project_dir;
 	unless (-d $project_dir) {
+		main::error('Missing project directory');
 		main::error_handler('dir-not-found', $project_dir);
 	}
 
@@ -1534,6 +1549,7 @@ sub lockfile_sanity_check {
 				main::error_handler('lockfile-pm-mismatch', $pm_lock, $lock);
 			}
 		}
+		main::error('Missing project lockfile');
 		main::error_handler('file-not-found', File::Spec->catfile($project_dir, $pm_lock));
 	}
 
