@@ -19,14 +19,15 @@ use strict;
 use warnings;
 
 use Cwd qw(abs_path);
-use Term::ANSIColor;
-use File::Find;
+use Term::ANSIColor qw(color colored);
+use File::Find qw(find);
 use JSON::PP qw(encode_json decode_json);
-use YAML::PP;
+use YAML::PP qw(Load);
 use URI ();
 
-use File::Path qw(make_path rmtree);
-use File::Temp ();
+use File::Path qw(make_path);
+use File::Spec ();
+use File::Temp qw(tempdir);
 use IPC::Run3 qw(run3);
 
 use Digest::SHA qw(sha1 sha512 sha256);
@@ -39,7 +40,7 @@ use Getopt::Long qw(GetOptions);
 Getopt::Long::Configure ('bundling', 'no_ignore_case', 'no_getopt_compat', 'no_auto_abbrev');
 use Pod::Usage qw(pod2usage);
 
-use Data::Dumper;
+#use Data::Dumper;
 
 our $VERSION = 2.01;
 
@@ -927,7 +928,7 @@ sub from_lock {
 			$data = Util::read_file("$deps_dir/$filename", 'raw');
 		}
 
-		my $workdir = File::Temp->newdir('packageXXXX', 'CLEANUP' => $opt{'cleanup'});
+		my $workdir = File::Temp::tempdir('packageXXXX', CLEANUP => $opt{'cleanup'});
 
 		my @cmd = (
 			'tar',
