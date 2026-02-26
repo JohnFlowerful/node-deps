@@ -22,7 +22,7 @@ use Cwd qw(abs_path);
 use Term::ANSIColor qw(color colored);
 use File::Find qw(find);
 use JSON::PP qw(encode_json decode_json);
-use YAML::PP qw(Load);
+use YAML::PP qw(DumpFile Load);
 use URI ();
 
 use File::Path qw(make_path);
@@ -58,6 +58,7 @@ my $cwd = Cwd::abs_path();
 my $project_dir; # PROJECT_DIR
 my $deps_dir; # DEPS_DIR
 my $cache_dir; # CACHE_DIR
+my $cache_port = 8081; # port used by the eclass to serve deps
 
 # package manager things
 my $npm_lock = 'package-lock.json';
@@ -99,9 +100,13 @@ sub main {
 			return show("Action unsupported for $friendly_lock{$pm_lock}. Skipping");
 		}
 		for my $lock (@lockfiles) {
-			my $data = fixup_lockfile(Util::read_file($lock));
+			my $data = Util::read_file($lock);
+
+			$data = fixup_npm_lockfile($data);
 			# it wont be pretty~
-			Util::write_file($lock, JSON::PP::encode_json($$data)) if $data;
+			if ($data) {
+				Util::write_file($lock, JSON::PP::encode_json($$data));
+			}
 		}
 	}
 	else {
@@ -124,7 +129,7 @@ sub main {
 						if (!$pkg->verify()) {
 							if (!$opt{'no-delete'} && ($opt{'delete'} || Util::prompt_yn('Do you want to re-download this package'))) {
 								push(@$packages, $pkg);
-								my $file = "$deps_dir/$pkg->{'filename'}";
+								my $file = File::Spec->catfile($deps_dir, $pkg->{'filename'});
 								logger("Deleting file $file");
 								unlink "$file" or error_handler('remove', "$file", "$!");
 							}
@@ -138,7 +143,7 @@ sub main {
 
 				$pkg->verify($data) if $opt{'verify'};
 
-				my $file = "$deps_dir/$pkg->{'filename'}";
+				my $file = File::Spec->catfile($deps_dir, $pkg->{'filename'});;
 				if (! -e $file) {
 					Util::write_file($file, $data);
 				}
@@ -182,36 +187,84 @@ sub main {
 		}
 
 		elsif ($act{'cache'}) {
-			if ($pm_lock ne $npm_lock) {
+			if ($pm_lock eq $yarn_lock) {
 				return show("Action unsupported for $friendly_lock{$pm_lock}. Skipping");
 			}
 
 			unless (-d $deps_dir) {
-				main::error('Missing dependency directory');
-				main::error_handler('dir-not-found', $deps_dir);
+				error('Missing dependency directory');
+				error_handler('dir-not-found', $deps_dir);
 			}
 
 			my ($found, $not_found) = compare_deps_dir_to_lockfile(@$packages);
 			if ($not_found) {
-				warning("Missing dependency tarballs in $deps_dir");
+				#warning("Missing dependency tarballs in $deps_dir");
 			}
 
-			my $dir = Path->new("$cache_dir/_cacache");
-			Path::make_path($dir);
-			error_handler('dir-not-empty', $$dir) if !Util::is_empty_dir($$dir);
+			package_manager({
+				npm => sub {
+					my $dir = File::Spec->catdir($cache_dir, '_cacache');
 
-			my $cache = Cacache->new($dir);
-			$cache->init();
+					$dir = Path->new($dir);
+					Path::make_path($dir);
+					unless (Util::is_empty_dir($$dir)) {
+						error_handler('dir-not-empty', $$dir);
+					}
 
-			for my $pkg (values @$packages) {
-				$cache->put("make-fetch-happen:request-cache:$pkg->{'uri'}", $pkg->{'uri'}, "$deps_dir/$pkg->{'filename'}", $pkg->integrity());
-			}
+					my $cache = Cacache->new($dir);
+					$cache->init();
+
+					for my $pkg (values @$packages) {
+						my $uri = $pkg->{'uri'};
+						$cache->put(
+							"make-fetch-happen:request-cache:$uri",
+							$uri,
+							File::Spec->catfile($deps_dir, $pkg->{'filename'}),
+							$pkg->integrity()
+						);
+					}
+				},
+				pnpm => sub {
+					my $dir = "$friendly_lock{$pm_lock}-cache";
+
+					$dir = Path->new($dir);
+					Path::make_path($dir);
+					unless (Util::is_empty_dir($$dir)) {
+						error_handler('dir-not-empty', $$dir);
+					}
+
+					my %gits;
+					for my $pkg (values @$packages) {
+						PnpmCache::put(
+							$dir,
+							$pkg->{'name'},
+							$pkg->{'uri'},
+							$pkg->{'filename'}
+						);
+
+						if ($pkg->{'specifics'}{'type'} eq 'git') {
+							$gits{$pkg->{'name'}} = $pkg->{'filename'};
+						}
+					}
+
+					for my $lock (@lockfiles) {
+						my $data = Util::read_file($lock);
+
+						$data = fixup_pnpm_lockfile_for_cache($data, \%gits);
+						if ($data) {
+							open(my $fh, '>:encoding(UTF-8)', $lock) or error_handler('open', $lock, "$!");
+							YAML::PP::DumpFile($fh, $$data);
+							close $fh;
+						}
+					}
+				}
+			});
 		}
 
 		elsif ($act{'verify-files'}) {
 			unless (-d $deps_dir) {
-				main::error('Missing dependency directory');
-				main::error_handler('dir-not-found', $deps_dir);
+				error('Missing dependency directory');
+				error_handler('dir-not-found', $deps_dir);
 			}
 
 			my ($found, $not_found) = compare_deps_dir_to_lockfile(@$packages);
@@ -233,13 +286,15 @@ sub main {
 	}
 }
 
-sub fixup_lockfile {
-	my ($decoded_lock) = JSON::PP::decode_json(@_);
+sub fixup_npm_lockfile {
+	my ($data) = @_;
+
+	$data = JSON::PP::decode_json($data);
 
 	my $fixed;
-	my $lock_ver = $decoded_lock->{'lockfileVersion'};
+	my $lock_ver = $data->{'lockfileVersion'};
 	if ($lock_ver =~ m/2|3/) {
-		for my $pkg (values %{$decoded_lock->{'packages'}}) {
+		for my $pkg (values %{ $data->{'packages'} }) {
 			# https://docs.npmjs.com/cli/configuring-npm/package-lock-json#packages
 			my $uri = URI->new($pkg->{'resolved'});
 			if (defined $uri->scheme) {
@@ -256,7 +311,36 @@ sub fixup_lockfile {
 		error_handler('lock-version-unsupported', $lock_ver);
 	}
 
-	return $fixed ? \$decoded_lock : undef;
+	return $fixed ? \$data : undef;
+}
+
+sub fixup_pnpm_lockfile_for_cache {
+	my ($data, $gits) = @_;
+
+	$data = YAML::PP::Load($data);
+
+	my $fixed;
+	my $lock_ver = $data->{'lockfileVersion'};
+	# version is a float
+	$lock_ver = Util::str_to_num($lock_ver);
+	# backwards compatible? let's test that
+	# https://github.com/orgs/pnpm/discussions/6857#discussioncomment-6538615
+	if ($lock_ver >= 9) {
+		for my $pkg_name (keys %{ $data->{'packages'} }) {
+			if ($gits->{$pkg_name}) {
+				my $pkg = $data->{'packages'}{$pkg_name};
+				if (Package::is_hosted_git_url($pkg->{'resolution'}{'tarball'})) {
+					$fixed = 1;
+					$pkg->{'resolution'}{'tarball'} = "http://localhost:$cache_port/$gits->{$pkg_name}";
+				}
+			}
+		}
+	}
+	else {
+		error_handler('lock-version-unsupported', $lock_ver);
+	}
+
+	return $fixed ? \$data : undef;
 }
 
 sub compare_deps_dir_to_lockfile {
@@ -286,7 +370,7 @@ sub compare_deps_dir_to_lockfile {
 	# %dir_files now contains files not listed in the lockfile
 	# ask to delete them
 	if (keys %dir_files && !$opt{'no-delete'}) {
-		warning('Warning: files not referenced in package-lock.json found!');
+		warning("Warning: files not referenced in $pm_lock found!");
 		
 		if (!$opt{'delete'}) {
 			Util::prompt_yn('Do you want to continue') || error_handler('dont-continue');
@@ -303,7 +387,7 @@ sub delete_files {
 
 	my $delete_all = $opt{'delete'} ? 1 : 0;
 	for my $file (values @files) {
-		my $file = "$deps_dir/$file";
+		my $file = File::Spec->catfile($deps_dir, $file);
 
 		my $delete;
 		if ($delete_all) {
@@ -727,7 +811,7 @@ sub _get_hosted_git_filename {
 	return undef;
 }
 
-sub _is_hosted_git_url {
+sub is_hosted_git_url {
 	my ($url) = @_;
 
 	return (
@@ -737,7 +821,7 @@ sub _is_hosted_git_url {
 	) && $url =~ m/tar.gz/;
 }
 
-sub _is_registry_url {
+sub is_registry_url {
 	my ($url) = @_;
 
 	return (
@@ -746,7 +830,7 @@ sub _is_registry_url {
 	) && $url =~ m/tgz/;
 }
 
-sub _get_registry_url_from_name {
+sub get_registry_path_from_name {
 	my ($pkg_name) = @_;
 
 	# @typescript-eslint/visitor-keys@8.40.0
@@ -754,10 +838,10 @@ sub _get_registry_url_from_name {
 	if ($pkg_name =~ m|^(@[^/]+/)?([^/]+)@([^/]+)$|) {
 		my ($scope, $package, $version) = ($1 || '', $2, $3);
 		if ($scope) {
-			return "https://registry.npmjs.org/$scope$package/-/$package-$version.tgz";
+			return "$scope$package/-/$package-$version.tgz";
 		}
 		else {
-			return "https://registry.npmjs.org/$package/-/$package-$version.tgz";
+			return "$package/-/$package-$version.tgz";
 		}
 	}
 	else {
@@ -796,14 +880,17 @@ sub _get_res_url {
 				if (!defined $tarball) {
 					if (defined $integrity) {
 						# npm registry
-						return _get_registry_url_from_name($pkg_name);
+						# for now this works. update this when a project doesn't
+						# use npmjs.org
+						my $path = get_registry_path_from_name($pkg_name);
+						return "https://registry.npmjs.org/$path";
 					}
 					else {
 						main::error_handler('no-integrity', $pkg_name)
 					}
 				}
 				else {
-					if (_is_hosted_git_url($tarball)) {
+					if (is_hosted_git_url($tarball)) {
 						# hosted tarball (github, bitbucket etc)
 						return $tarball;
 					}
@@ -894,7 +981,7 @@ sub from_lock {
 		main::error_handler('no-uri', $pkg_name, $url)
 	}
 
-	if (_is_registry_url($uri)) {
+	if (is_registry_url($uri)) {
 		# filename must include the scope to avoid clobbering
 		# https://docs.npmjs.com/about-scopes
 		my @segments = $uri->path_segments;
@@ -917,15 +1004,16 @@ sub from_lock {
 			'integrity' => $integrity,
 		);
 	}
-	elsif (_is_hosted_git_url($uri)) {
+	elsif (is_hosted_git_url($uri)) {
 		$filename = _get_hosted_git_filename($uri);
 
 		my $data;
-		if (! -e "$deps_dir/$filename") {
+		my $file = File::Spec->catfile($deps_dir, $filename);
+		if (! -e $file) {
 			$data = Util::fetch($uri);
 		}
 		else {
-			$data = Util::read_file("$deps_dir/$filename", 'raw');
+			$data = Util::read_file($file, 'raw');
 		}
 
 		my $workdir = File::Temp::tempdir('packageXXXX', CLEANUP => $opt{'cleanup'});
@@ -950,6 +1038,9 @@ sub from_lock {
 		# existing
 		my $path = $uri->path;
 		unless (-e $path) {
+			# usually it's files from a stripped workspace based project
+			# the script will still create a perfectly useable cacache structure
+			# in this case
 			main::warning("Missing dependency for package $pkg_name ($path)");
 			#main::error_handler('file-not-found', $path);
 		}
@@ -980,7 +1071,7 @@ sub from_lock {
 sub get {
 	my $self = shift;
 
-	my $file = "$deps_dir/$self->{'filename'}";
+	my $file = File::Spec->catfile($deps_dir, $self->{'filename'});
 	if (! -e $file) {
 		return Util::fetch($self->{'uri'});
 	}
@@ -1064,7 +1155,7 @@ sub init {
 sub put {
 	my $self = shift;
 
-	my ($key, $url, $file, $integrity) = @_;
+	my ($key, $uri, $file, $integrity) = @_;
 
 	my ($algo, $hex);
 	if ($integrity) {
@@ -1108,7 +1199,7 @@ sub put {
 		time => 0,
 		size => -s $file,
 		metadata => {
-			url => $url->as_string,
+			url => $uri->as_string,
 			options => {
 				compress => JSON::PP::true
 			}
@@ -1117,6 +1208,45 @@ sub put {
 
 	$json_data = Digest::SHA::sha1_hex($json_data) . "\t" . $json_data;
 	Util::write_file($$index_path, $json_data);
+}
+}
+
+{
+package PnpmCache;
+# why do it this way?
+# we could follow nixos and distribute the cafs cache generated by pnpm, or
+# write something here to create our own.
+# looking into writing our own: a major hurdle is this sideeffectscachekey,
+# which is generated after running certain install/postinstall scripts
+# either way, it appears that the way nixos serving this cache is deprecated:
+# https://pnpm.io/cli/server/
+#
+# for now, symlinking the files and serving them with an adjusted registry
+# setting (in .npmrc) works.
+sub _get_cache_path {
+	my ($pkg_name, $uri, $filename) = @_;
+
+	if (Package::is_registry_url($uri)) {
+		return Package::get_registry_path_from_name($pkg_name);
+	}
+	elsif (Package::is_hosted_git_url($uri)) {
+		return $filename;
+	}
+}
+
+# symlink tarballs into a structure mirroring the registry
+sub put {
+	my ($dir, $pkg_name, $uri, $filename) = @_;
+
+	my $file_path = _get_cache_path($pkg_name, $uri, $filename);
+	$file_path = File::Spec->catfile($$dir, $file_path);
+
+	my $dir_path = Path->new($file_path);
+	Path::make_path($dir_path->parent());
+
+	my $file = File::Spec->catfile($deps_dir, $filename);
+
+	symlink($file, $file_path) or main::error_handler('symlink', $file_path, $!);
 }
 }
 
@@ -1380,6 +1510,16 @@ sub is_empty_dir {
 	return $count == 0;
 }
 
+sub str_to_num {
+	my ($str) = @_;
+
+	my $num = eval { $str + 0 };
+	unless ($@) {
+		return $num;
+	}
+	return undef;
+}
+
 sub prompt {
 	my ($query, @accepted) = @_;
 
@@ -1496,15 +1636,27 @@ sub post_process {
 		$pm_lock = $npm_lock;
 	}
 
-	$cache_dir = $opt{'cache-dir'} ? File::Spec->rel2abs($opt{'cache-dir'}) : "$cwd/$friendly_lock{$pm_lock}-cache";
+	$cache_dir = (
+		$opt{'cache-dir'}
+		? File::Spec->rel2abs($opt{'cache-dir'})
+		: File::Spec->catdir($cwd, "$friendly_lock{$pm_lock}-cache")
+	);
 	$cache_dir = $ENV{'CACHE_DIR'} || $cache_dir;
 
-	$deps_dir = $opt{'deps-dir'} ? File::Spec->rel2abs($opt{'deps-dir'}) : "$cwd/$friendly_lock{$pm_lock}-deps";
+	$deps_dir = (
+		$opt{'deps-dir'}
+		? File::Spec->rel2abs($opt{'deps-dir'})
+		: File::Spec->catdir($cwd, "$friendly_lock{$pm_lock}-deps")
+	);
 	$deps_dir = $ENV{'DEPS_DIR'} || $deps_dir;
 
 	# rel2abs will always return an absolute path. it doesn't perform filesystem
 	# checks however
-	$project_dir = $opt{'project-dir'} ? File::Spec->rel2abs($opt{'project-dir'}) : $cwd;
+	$project_dir = (
+		$opt{'project-dir'}
+		? File::Spec->rel2abs($opt{'project-dir'})
+		: $cwd
+	);
 	$project_dir = $ENV{'PROJECT_DIR'} || $project_dir;
 	unless (-d $project_dir) {
 		main::error('Missing project directory');
