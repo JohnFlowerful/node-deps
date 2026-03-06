@@ -204,7 +204,6 @@ sub main {
 			package_manager({
 				npm => sub {
 					my $dir = File::Spec->catdir($cache_dir, '_cacache');
-
 					$dir = Path->new($dir);
 					Path::make_path($dir);
 					unless (Util::is_empty_dir($$dir)) {
@@ -225,9 +224,7 @@ sub main {
 					}
 				},
 				pnpm => sub {
-					my $dir = "$friendly_lock{$pm_lock}-cache";
-
-					$dir = Path->new($dir);
+					my $dir = Path->new($cache_dir);
 					Path::make_path($dir);
 					unless (Util::is_empty_dir($$dir)) {
 						error_handler('dir-not-empty', $$dir);
@@ -286,6 +283,9 @@ sub main {
 	}
 }
 
+# only useful for ancient npm (pacote) versions. npm skips verifying integrity
+# for git packages internally now
+# https://github.com/npm/pacote/blob/v21.4.0/lib/git.js#L41-L44
 sub fixup_npm_lockfile {
 	my ($data) = @_;
 
@@ -293,16 +293,16 @@ sub fixup_npm_lockfile {
 
 	my $fixed;
 	my $lock_ver = $data->{'lockfileVersion'};
-	if ($lock_ver =~ m/2|3/) {
+	if ($lock_ver =~ m/1/) {
+		fixup_v1_deps($data->{'dependencies'});
+	}
+	elsif ($lock_ver =~ m/2|3/) {
 		for my $pkg (values %{ $data->{'packages'} }) {
-			# https://docs.npmjs.com/cli/configuring-npm/package-lock-json#packages
-			my $uri = URI->new($pkg->{'resolved'});
-			if (defined $uri->scheme) {
-				if ($pkg->{'integrity'}) {
-					if ($uri->scheme =~ m/^(git|git\+ssh|git\+https|ssh)$/) {
-						$fixed = 1;
-						delete $pkg->{'integrity'};
-					}
+			my $res = $pkg->{'resolved'};
+			if (defined $res) {
+				if (Package::is_git_url($res) && defined $pkg->{'integrity'}) {
+					$fixed = 1;
+					delete $pkg->{'integrity'};
 				}
 			}
 		}
@@ -312,6 +312,29 @@ sub fixup_npm_lockfile {
 	}
 
 	return $fixed ? \$data : undef;
+}
+
+sub fixup_v1_deps {
+	my ($deps) = @_;
+
+	my $fixed;
+
+	for my $pkg (values %{ $deps }) {
+		my $res = $pkg->{'resolved'};
+		if (defined $res) {
+			if (Package::is_git_url($res) && defined $pkg->{'integrity'}) {
+				$fixed = 1;
+				delete $pkg->{'integrity'};
+			}
+		}
+
+		my $more_deps = $deps->{'dependencies'};
+		if (defined $more_deps) {
+			fixup_v1_deps($more_deps);
+		}
+	}
+
+	return $fixed ? \$deps : undef;
 }
 
 sub fixup_pnpm_lockfile_for_cache {
@@ -481,13 +504,120 @@ sub lockfile {
 	return \@packages;
 }
 
+sub to_new_packages {
+	my ($deps) = @_;
+
+	my @packages;
+
+	for my $pkg_name (keys %{ $deps }) {
+		my $pkg = $deps->{$pkg_name};
+
+		if ($pkg->{'bundled'}) {
+			next;
+		}
+
+		my $version = $pkg->{'version'} // '';
+		my $res = $pkg->{'resolved'} // '';
+		my $uri = URI->new($version);
+		if (defined $uri->scheme) {
+			if ($uri =~ m/^npm:/) {
+				if (defined URI->new($res)->scheme) {
+					$pkg->{'version'} = $res;
+				}
+			}
+			else {
+				my %hosts = (
+					github => "github.com",
+					bitbucket => "bitbucket.org",
+					gitlab => "gitlab.com",
+				);
+				for my $scheme (keys %hosts) {
+					# github:ramya-rao-a/css-parser#370c480ac103bd17c7bcfb34bf5d577dc40d3660
+					# git+ssh://git@github.com/ramya-rao-a/css-parser.git#370c480ac103bd17c7bcfb34bf5d577dc40d3660
+					if ($uri->scheme() eq $scheme) {
+						$version = do {
+							my $new_uri = URI->new('git+ssh://git@a.b');
+
+							$new_uri->authority($hosts{$scheme});
+
+							if ($uri->path =~ m/.git$/) {
+								$new_uri->path($uri->path());
+							}
+							else {
+								$new_uri->path($uri->path() . '.git')
+							}
+
+							$new_uri->fragment($uri->fragment());
+
+							$new_uri;
+						};
+
+						last;
+					}
+				}
+			}
+		}
+
+		# note: $pkg_name can appear more than once in a v1 lockfile due to the
+		# recursive dependencies
+		push(@packages, {
+			name => $pkg_name,
+			version => undef,
+			resolved => URI->new($version)->scheme ? $version : $res,
+			integrity => $pkg->{'integrity'}
+		});
+
+		my $more_deps = $pkg->{'dependencies'};
+		if (defined $more_deps) {
+			my $more_packages = to_new_packages($more_deps);
+			@packages = (@packages, @$more_packages);
+		}
+	}
+
+	return \@packages;
+}
+
 sub get_packages {
 	my ($lock) = @_;
 
 	my $content = package_manager({
 		npm => sub {
-			my $data = Util::read_file($lock);
-			return JSON::PP::decode_json($data) || error_handler('lockfile-decode-fail', $lock, $!);
+			my $json = Util::read_file($lock);
+			$json = JSON::PP::decode_json($json) || error_handler('lockfile-decode-fail', $lock, $!);
+			my $lock_ver = $json->{'lockfileVersion'};
+			if ($lock_ver =~ m/1/) {
+				# v1 lockfiles can have multiple instances of the same version
+				# of package. dedup the one with lesser integrity
+
+				my $data = {};
+				my $seen = {};
+				$data->{'packages'} = $seen;
+
+				my $packages = to_new_packages($json->{'dependencies'});
+				for my $pkg (@$packages) {
+					my $res = $pkg->{'resolved'};
+					my $integrity = $pkg->{'integrity'};
+
+					if (defined $res) {
+						if (defined $integrity) {
+							if (exists $seen->{$res} && exists $seen->{$res}{'integrity'}) {
+								my ($h1, $rank) = Util::integrity_to_best($integrity);
+								my ($h2, $seen_rank) = Util::integrity_to_best($seen->{$res}{'integrity'});
+
+								if ($rank > $seen_rank) {
+									$seen->{$res} = $pkg;
+								}
+							}
+						}
+						$seen->{$res} = $pkg;
+					}
+				}
+				return $data;
+			}
+			elsif ($lock_ver =~ m/2|3/) {
+				return $json;
+			}
+
 		},
 		pnpm => sub {
 			my $data = Util::read_file($lock);
@@ -554,7 +684,9 @@ sub get_packages {
 
 		if ($pkg_name ne '') {
 			if (defined $res) {
-				$pkg->{'name'} = $pkg_name;
+				unless (exists $pkg->{'name'}) {
+					$pkg->{'name'} = $pkg_name;
+				}
 				push(@packages, $pkg);
 			}
 		}
@@ -690,6 +822,15 @@ sub show {
 	print "$output_prefix $str\n";
 }
 
+sub _apply_prefix {
+	my ($str, $prefix) = @_;
+
+	my @lines = split(/\n/, $str);
+	@lines = map { "$prefix $_" } @lines;
+
+	return join("\n", @lines);
+}
+
 # todo: log properly
 # todo: maybe stats as well
 sub logger {
@@ -701,13 +842,15 @@ sub logger {
 sub warning {
 	my ($str) = @_;
 
-	warn "$warn_prefix $str\n";
+	$str = _apply_prefix($str, $warn_prefix);
+	warn "$str\n";
 }
 
 sub error {
 	my ($str) = @_;
 
-	print "$err_prefix $str\n";
+	$str = _apply_prefix($str, $err_prefix);
+	print "$str\n";
 }
 
 sub trap_cleanup {
@@ -766,7 +909,11 @@ sub _get_hosted_git_url {
 
 		return "https://bitbucket.org/$user/$project/get/$commit.tar.gz";
 	}
-	elsif ($authority =~ m/gitlab.com$/) {
+	# npm expects url's to match:
+	# https://gitlab.com/$user/$project/repository/archive.tar.gz?ref=$commit
+	# these url's require the user to login. to fix: simply change the url in
+	# the cacache file structure and download using the working url below
+	elsif ($authority =~ m/gitlab.com$/ && $pm_lock ne $npm_lock) {
 		my $path = $uri->path;
 		if ($path =~ m/\/-\// || $path =~ m/\/archive\.tar\.gz/) {
 			return undef;
@@ -830,6 +977,12 @@ sub is_registry_url {
 	) && $url =~ m/tgz/;
 }
 
+sub is_git_url {
+	my ($res) = @_;
+
+	return $res =~ m/^(git|git\+ssh|git\+https|ssh):\/\/(.*)/;
+}
+
 sub get_registry_path_from_name {
 	my ($pkg_name) = @_;
 
@@ -854,7 +1007,7 @@ sub _get_res_url {
 
 	my $url = main::package_manager({
 		npm => sub {
-			if ($res =~ m/^(git|git\+ssh|git\+https|ssh):\/\/(.*)/) {
+			if (is_git_url($res)) {
 				my $hosted = _get_hosted_git_url(URI->new($res));
 				unless ($hosted) {
 					main::error_handler('no-hosted-url', $pkg_name, $res);
@@ -902,7 +1055,7 @@ sub _get_res_url {
 					}
 					else {
 						# a tarball from an unknown source. warn
-						warning("Warning: package \"$pkg_name\" is using an unknown source");
+						main::warning("Warning: package \"$pkg_name\" is using an unknown source");
 						return $tarball;
 					}
 				}
@@ -934,7 +1087,7 @@ sub _get_res_url {
 			}
 		},
 		yarn => sub {
-			if ($res =~ m/^(git|git\+ssh|git\+https|ssh):\/\/(.*)/) {
+			if (is_git_url($res)) {
 				my $hosted = _get_hosted_git_url(URI->new($res));
 				unless ($hosted) {
 					main::error_handler('no-hosted-url', $pkg_name, $res);
@@ -954,6 +1107,7 @@ sub _get_res_url {
 # pnpm provides the relevant git hosted url if site supports it
 # pnpm tarball packages have integrity only when they're local (i.e. type)
 # pnpm removes .git directory when package is git hosted
+# very old dependencies 
 sub from_lock {
 	my $class = shift;
 
@@ -994,7 +1148,7 @@ sub from_lock {
 			}
 		});
 
-		my $integrity = Util::integrity_to_best($integrity);
+		my ($integrity) = Util::integrity_to_best($integrity);
 		unless ($integrity) {
 			main::error_handler('no-integrity', $pkg_name);
 		}
@@ -1062,6 +1216,7 @@ sub from_lock {
 		'name' => $pkg_name,
 		'filename' => $filename,
 		'uri' => $uri,
+		'res' => $res,
 		'specifics' => \%specifics,
 	};
 
@@ -1239,7 +1394,7 @@ sub put {
 	my ($dir, $pkg_name, $uri, $filename) = @_;
 
 	my $file_path = _get_cache_path($pkg_name, $uri, $filename);
-	$file_path = File::Spec->catfile($$dir, $file_path);
+	$file_path = File::Spec->catfile($dir, $file_path);
 
 	my $dir_path = Path->new($file_path);
 	Path::make_path($dir_path->parent());
@@ -1253,19 +1408,14 @@ sub put {
 {
 package Path;
 
-sub _cleanup_path_strings {
-	my (@strings) = @_;
-
-	map { s/^\/|\/$//g } @strings;
-	return join('/', @strings);
-}
+use overload '""' => \&as_string, fallback => 1;
 
 sub new {
 	my $class = shift;
 
 	my ($path) = @_;
 
-	$path =~ s/\/$//;
+	$path = File::Spec->canonpath($path);
 
 	return bless \$path, $class;
 }
@@ -1275,17 +1425,7 @@ sub append {
 
 	my (@strings) = @_;
 
-	my $strings = _cleanup_path_strings(@strings);
-	$$self .= '/' . $strings;
-}
-
-sub prepend {
-	my $self = shift;
-
-	my (@strings) = @_;
-
-	my $strings = _cleanup_path_strings(@strings);
-	substr($$self, 0, 0, '/' . $strings);
+	$$self = File::Spec->catfile($$self, @strings);
 }
 
 sub push {
@@ -1314,6 +1454,11 @@ sub parent {
 	my $new_self = Path->new(File::Basename::dirname($$old_self));
 
 	return $new_self;
+}
+
+sub as_string {
+    my $self = shift;
+    $$self;
 }
 
 sub make_path {
@@ -1350,13 +1495,19 @@ my %algos = ('sha1' => 1, 'sha512' => 2);
 sub integrity_to_best {
 	my ($integrity) = @_;
 
-	my ($best, $hash) = (0, undef);
+	my $rank = 0;
+	my $hash = undef;
+
 	my @hashes = split(/ /, $integrity);
 	for my $str (@hashes) {
 		my ($algo, $b64_str) = integrity_split($str);
-		($best, $hash) = ($algos{$algo}, $str) if $best < $algos{$algo};
+		if ($rank < $algos{$algo}) {
+			$hash = $str;
+			$rank = $algos{$algo};
+		}
 	}
-	return $hash;
+
+	return ($hash, $rank);
 }
 
 sub integrity_to_hex {
