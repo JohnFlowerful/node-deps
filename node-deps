@@ -328,8 +328,9 @@ sub fixup_v1_deps {
 			}
 		}
 
-		my $more_deps = $deps->{'dependencies'};
+		my $more_deps = $pkg->{'dependencies'};
 		if (defined $more_deps) {
+			# this wont work...
 			fixup_v1_deps($more_deps);
 		}
 	}
