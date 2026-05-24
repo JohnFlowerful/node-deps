@@ -1108,7 +1108,6 @@ sub _get_res_url {
 # pnpm provides the relevant git hosted url if site supports it
 # pnpm tarball packages have integrity only when they're local (i.e. type)
 # pnpm removes .git directory when package is git hosted
-# very old dependencies 
 sub from_lock {
 	my $class = shift;
 
@@ -1140,7 +1139,7 @@ sub from_lock {
 		# filename must include the scope to avoid clobbering
 		# https://docs.npmjs.com/about-scopes
 		my @segments = $uri->path_segments;
-		$filename = ($segments[1] =~ m/^@/) ? "$segments[1]_$segments[-1]" : "$segments[-1]";
+		$filename = ($segments[1] =~ m/^@/) ? "$segments[1]-$segments[-1]" : "$segments[-1]";
 
 		# strip sum fragment from yarn urls
 		main::package_manager({
@@ -1458,8 +1457,8 @@ sub parent {
 }
 
 sub as_string {
-    my $self = shift;
-    $$self;
+	my $self = shift;
+	$$self;
 }
 
 sub make_path {
