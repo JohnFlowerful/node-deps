@@ -58,7 +58,6 @@ my $cwd = Cwd::abs_path();
 my $project_dir; # PROJECT_DIR
 my $deps_dir; # DEPS_DIR
 my $cache_dir; # CACHE_DIR
-my $cache_port = 8081; # port used by the eclass to serve deps
 
 # package manager things
 my $npm_lock = 'package-lock.json';
