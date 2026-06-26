@@ -58,6 +58,8 @@ my $cwd = Cwd::abs_path();
 my $project_dir; # PROJECT_DIR
 my $deps_dir; # DEPS_DIR
 my $cache_dir; # CACHE_DIR
+my $cache_port; # CACHE_PORT
+my $_cache_port_default = 8000;
 
 # package manager things
 my $npm_lock = 'package-lock.json';
@@ -142,7 +144,7 @@ sub main {
 
 				$pkg->verify($data) if $opt{'verify'};
 
-				my $file = File::Spec->catfile($deps_dir, $pkg->{'filename'});;
+				my $file = File::Spec->catfile($deps_dir, $pkg->{'filename'});
 				if (! -e $file) {
 					Util::write_file($file, $data);
 				}
@@ -1230,7 +1232,7 @@ sub get {
 		return Util::fetch($self->{'uri'});
 	}
 	else {
-		return Util::read_file($file, 'raw');;
+		return Util::read_file($file, 'raw');
 	}
 }
 
@@ -1711,6 +1713,7 @@ sub get {
 		$opt{'pack'} = 1; },
 	'pm=s' => \$opt{'pm'},
 	'cache-dir=s' => \$opt{'cache-dir'},
+	'cache-port=i' => \$opt{'cache-port'},
 	'project-dir=s' => \$opt{'project-dir'},
 	'deps-dir=s' => \$opt{'deps-dir'},
 	'find' => sub {
@@ -1792,6 +1795,17 @@ sub post_process {
 		: File::Spec->catdir($cwd, "$friendly_lock{$pm_lock}-cache")
 	);
 	$cache_dir = $ENV{'CACHE_DIR'} || $cache_dir;
+
+	$cache_port = (
+		$opt{'cache-port'}
+		? $opt{'cache-port'}
+		: $_cache_port_default
+	);
+	$cache_port = $ENV{'CACHE_PORT'} || $cache_port;
+	unless ($cache_port == int($cache_port)) {
+		main::error('Cache port must be an integer');
+		main::error_handler('option-argument-unknown', $cache_port);
+	}
 
 	$deps_dir = (
 		$opt{'deps-dir'}
@@ -1890,6 +1904,9 @@ node-deps [action] [options]
         --cache-dir     Set the directory where the cache structure will be
                         generated. This path is relative to the current working
                         directory
+        --cache-port    The port used to substitute git based packages in
+                        pnpm lockfiles. Only useful in conjunction with the
+                        Gentoo pnpm.eclass
 
     verify-files    Verify downloaded archives against the lockfile's integrity
                     string
