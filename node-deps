@@ -246,7 +246,7 @@ sub main {
 					}
 
 					for my $lock (@lockfiles) {
-						my $data = Util::read_file($lock);
+						my $data = Util::read_file($lock, 'encoding(UTF-8)');
 
 						$data = fixup_pnpm_lockfile_for_cache($data, \%gits);
 						if ($data) {
@@ -622,7 +622,7 @@ sub get_packages {
 
 		},
 		pnpm => sub {
-			my $data = Util::read_file($lock);
+			my $data = Util::read_file($lock, 'encoding(UTF-8)');
 			return YAML::PP::Load($data); # outputs its own error and dies
 		},
 		yarn => sub {
@@ -1168,7 +1168,7 @@ sub from_lock {
 			$data = Util::fetch($uri);
 		}
 		else {
-			$data = Util::read_file($file, 'raw');
+			$data = Util::read_file($file);
 		}
 
 		my $workdir = File::Temp::tempdir('packageXXXX', CLEANUP => $opt{'cleanup'});
@@ -1232,7 +1232,7 @@ sub get {
 		return Util::fetch($self->{'uri'});
 	}
 	else {
-		return Util::read_file($file, 'raw');
+		return Util::read_file($file);
 	}
 }
 
@@ -1633,9 +1633,8 @@ sub make_abs_to_project_dir {
 
 sub read_file {
 	my ($file, $encoding) = @_;
-	# default to :encoding(UTF-8) instead of simply :utf-8. this is to check if
-	# the data is valid utf-8. see https://metacpan.org/pod/PerlIO::encoding
-	$encoding //= 'encoding(UTF-8)';
+
+	$encoding //= 'raw';
 
 	my $data = do {
 		open(my $fh, "<:$encoding", $file) or main::error_handler('open', $file, $!);
