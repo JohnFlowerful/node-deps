@@ -155,7 +155,10 @@ sub main {
 
 			if ($opt{'pack'}) {
 				my $filename = "$friendly_lock{$pm_lock}-deps.tar.gz";
-				$deps_dir =~ s/^$cwd\///;
+
+				my $basename = File::Basename::basename($deps_dir);
+				my $parent_dir = File::Basename::dirname($deps_dir);
+
 				my @cmd = (
 					'tar',
 					'--auto-compress',
@@ -166,8 +169,8 @@ sub main {
 					'--create',
 					"--file=$filename",
 					'-C',
-					"$cwd",
-					"$deps_dir"
+					"$parent_dir",
+					"$basename"
 				);
 				run3(\@cmd, \undef, \undef);
 				error_handler('system-tar', join(' ', @cmd)) if $?;
